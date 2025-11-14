@@ -1,0 +1,204 @@
+---
+alwaysApply: true
+---
+# SAMURAI 项目 Cursor Rules
+
+## 项目概述
+这是SAMURAI (Adapting Segment Anything Model for Zero-Shot Visual Tracking with Motion-Aware Memory) 项目，基于Meta的SAM 2模型实现的零样本视觉目标跟踪系统。
+
+### 核心特性
+- **零样本跟踪**：无需额外训练，直接使用SAM 2.1预训练权重
+- **运动感知记忆**：通过卡尔曼滤波器融合运动信息和外观特征
+- **三阶段跟踪策略**：初始化 → 预热 → 稳定跟踪
+- **智能记忆库选择**：基于质量指标动态选择历史帧
+
+## 核心架构组件
+
+### 1. 关键模块位置
+```
+sam2/sam2/modeling/
+├── sam2_base.py              # 🎯 SAMURAI核心逻辑 (420-534行: 多掩码选择, 730-750行: 记忆库选择)
+├── backbones/                # 图像编码器 (Hiera + FPN)
+├── memory_attention.py       # 记忆注意力机制
+├── memory_encoder.py         # 记忆编码器
+└── sam/mask_decoder.py      # SAM解码器
+
+sam2/sam2/utils/
+├── kalman_filter.py          # 🎯 卡尔曼滤波器实现
+└── diversity_selection.py    # 🎯 THOR多样性选择实现
+
+sam2/sam2/sam2_video_predictor.py # 🎯 主要推理接口
+sam2/sam2/configs/samurai/         # 🎯 SAMURAI配置文件
+```
+
+### 2. SAMURAI 核心参数
+```yaml
+# sam2/sam2/configs/samurai/sam2.1_hiera_b+.yaml
+samurai_mode: true                    # 启用SAMURAI功能
+kf_score_weight: 0.25                 # 卡尔曼IoU权重 (0.0-0.5)
+stable_frames_threshold: 15           # 预热期长度 (5-30)
+stable_ious_threshold: 0.3            # 稳定跟踪IoU阈值 (0.2-0.5)
+memory_bank_iou_threshold: 0.5        # 记忆库质量过滤 (0.3-0.7)
+memory_bank_obj_score_threshold: 0.0  # 对象存在阈值
+memory_bank_kf_score_threshold: 0.0   # 运动一致性阈值
+```
+
+## 开发工作流程
+
+### 三阶段工作流
+遵循 `workflow3.md` 中定义的标准流程：
+
+#### 【分析问题】阶段
+- 理解需求，消除歧义
+- 全面搜索相关代码
+- 识别问题根因
+- 必须使用中文回答
+- 发现重复代码、不合理命名、过时设计等
+- **禁止**：修改任何代码、跳过搜索步骤
+- **禁止**：撰写冗余的文档
+
+
+#### 【制定方案】阶段
+- 明确技术决策
+- 列出变更文件和描述
+- 消除重复逻辑，遵循DRY原则
+- 确保良好架构设计
+- 必须使用中文回答
+- **禁止**：撰写冗余的文档
+
+#### 【执行方案】阶段
+- 严格按方案实现
+- 运行类型检查
+- 代码需要高度解耦
+- 必须使用中文回答
+- **禁止**：撰写冗余的文档
+
+## 代码规范
+
+### 1. 文件修改原则
+- **核心文件**需特别谨慎：`sam2_base.py`, `kalman_filter.py`, `diversity_selection.py`, `sam2_video_predictor.py`
+- 新增SAMURAI参数必须同时更新配置文件
+- 修改算法逻辑时要考虑三阶段跟踪策略的完整性
+- 保持与原始SAM 2的兼容性 (`samurai_mode: false`)
+- 代码需要高度解耦
+- 必须使用中文回答
+
+### 2. 关键代码区域
+```python
+# sam2_base.py 核心区域 - 需要特殊注意
+def _forward_sam_heads(self, ...):
+    # 行420-534: SAMURAI多掩码选择逻辑
+    if multimask_output and self.samurai_mode:
+        # 三阶段决策逻辑
+        # 卡尔曼预测和加权融合
+        # IoU计算和质量检查
+
+### 3. 调试最佳实践
+```python
+# 调试卡尔曼状态
+print(f"KF mean: {self.kf_mean}")
+print(f"Stable frames: {self.stable_frames}")
+print(f"Predicted bbox: {predicted_bbox}")
+
+# 可视化多掩码选择
+print(f"SAM IoUs: {ious}")
+print(f"KF IoUs: {kf_ious}")
+print(f"Weighted IoUs: {weighted_ious}")
+print(f"Selected: {best_iou_inds}")
+
+# 检查记忆库质量
+for idx in valid_indices:
+    out = output_dict["non_cond_frame_outputs"][idx]
+    print(f"Frame {idx}: IoU={out['best_iou_score']:.3f}")
+
+## 常用代码模式
+
+### 1. 基础推理设置
+```python
+from sam2.build_sam import build_sam2_video_predictor
+
+# 构建SAMURAI预测器
+predictor = build_sam2_video_predictor(
+    "configs/samurai/sam2.1_hiera_b+.yaml",
+    "checkpoints/sam2.1_hiera_base_plus.pt"
+)
+
+# 初始化推理状态
+state = predictor.init_state(
+    video_path, 
+    offload_video_to_cpu=True,    # 内存优化
+    offload_state_to_cpu=True     # 状态优化
+)
+
+# 添加第一帧提示
+bbox = (x1, y1, x2, y2)  # 边界框格式
+predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=0)
+
+# 逐帧跟踪
+for frame_idx, obj_ids, masks in predictor.propagate_in_video(state):
+    mask = masks[0]  # shape: (1, H, W)
+```
+
+### 2. 从掩码提取边界框
+```python
+def extract_bbox_from_mask(mask):
+    """从掩码提取边界框，SAMURAI标准实现"""
+    mask_np = mask.cpu().numpy() > 0.0
+    non_zero = np.argwhere(mask_np)
+    if len(non_zero) > 0:
+        y_min, x_min = non_zero.min(axis=0)
+        y_max, x_max = non_zero.max(axis=0)
+        return [x_min, y_min, x_max, y_max]  # xyxy格式
+    return [0, 0, 0, 0]
+```
+
+### 3. 切换SAM 2模式与THOR策略
+```python
+# 禁用SAMURAI，使用原始SAM 2
+predictor = build_sam2_video_predictor(
+    "configs/sam2.1/sam2.1_hiera_b+.yaml",  # 注意路径差异
+    checkpoint_path
+)
+
+# 使用SAMURAI但禁用THOR多样性选择（回退到最近帧策略）
+# 在配置文件中设置: memory_bank_selection_mode: "recent"
+```
+
+## 重要提醒
+
+### 🚨 修改警告
+- **sam2_base.py 420-534行**：多掩码选择的核心逻辑，修改需极其谨慎
+- **sam2_base.py 730-750行**：THOR多样性记忆库选择机制，影响整体跟踪质量
+- **diversity_selection.py**：格拉姆行列式计算和贪心选择算法，修改需深度理解线性代数
+- **kalman_filter.py**：运动模型实现，参数调整需要深度理解
+- **配置文件同步**：新增参数必须在所有相关配置文件中同步
+
+### ✅ 安全修改区域
+- 推理脚本 (`scripts/`)
+- 数据加载和预处理
+- 可视化和输出格式
+- 评估指标计算
+- 配置参数调整（在合理范围内）
+- THOR参数调优（`memory_bank_selection_mode`, `diversity_eps` 等）
+
+### 📋 修改检查清单
+- [ ] 是否保持三阶段跟踪逻辑完整性？
+- [ ] 是否更新了相应的配置文件？
+- [ ] 是否考虑了向后兼容性？
+- [ ] 是否运行了基本的推理测试？
+- [ ] 是否检查了内存使用和性能影响？
+- [ ] THOR参数是否在合理范围内？（如 diversity_eps > 0）
+
+## 文档结构
+
+项目包含完整的技术文档（/docs）：
+- `README.md`：项目介绍和快速开始
+- `ARCHITECTURE.md`：详细架构文档
+- `QUICK_REFERENCE.md`：快速参考手册
+- `WORKFLOW_DIAGRAMS.md`：可视化流程图
+- `MEMORY_BANK_ARCHITECTURE.md`：记忆库详细讲解
+
+## 数据集目录
+got10k:/data/yangkai/pytracking/testing_dataset/GOT-10k/test/
+LaSOT:/data/yangkai/pytracking/testing_dataset/LaSOT
+优先参考这些文档来理解项目结构和实现细节。
