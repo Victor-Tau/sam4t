@@ -40,7 +40,7 @@ if model_name == "base_plus":
 else:
     model_cfg = f"configs/samurai/sam2.1_hiera_{model_name[0]}.yaml"
 
-video_folder= "data/LaSOT"
+video_folder= "/data/yangkai/pytracking/testing_dataset/LaSOT"
 pred_folder = f"results/{exp_name}/{exp_name}_{model_name}"
 
 save_to_video = True
