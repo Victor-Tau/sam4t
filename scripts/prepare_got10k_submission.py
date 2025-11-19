@@ -110,7 +110,7 @@ def prepare_got10k_submission(exp_name, model_name):
 
 def main():
     parser = argparse.ArgumentParser(description='Prepare GOT-10k submission package')
-    parser.add_argument('--exp_name', type=str, default='camera',
+    parser.add_argument('--exp_name', type=str, default='samurai',
                         help='Experiment name (default: samurai)')
     parser.add_argument('--model_name', type=str, default='base_plus',
                         help='Model name (default: base_plus)')

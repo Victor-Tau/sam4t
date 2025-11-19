@@ -35,7 +35,7 @@ color = [
 video_folder = "/data/yangkai/pytracking/testing_dataset/GOT-10k/test"
 
 exp_name = "samurai"
-model_name = "large"
+model_name = "base_plus"
 
 checkpoint = f"sam2/checkpoints/sam2.1_hiera_{model_name}.pt"
 if model_name == "base_plus":

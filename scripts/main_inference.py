@@ -27,7 +27,7 @@ color = [
     (255, 0, 0),
 ]
 
-testing_set = "data/LaSOT/testing_set.txt"
+testing_set = "/data1/tao/code/sam4t/testing_set.txt"
 with open(testing_set, 'r') as f:
     test_videos = f.readlines()
 
@@ -53,12 +53,12 @@ if save_to_video:
 test_videos = sorted(test_videos)
 for vid, video in enumerate(test_videos):
 
-    cat_name = video.split('-')[0]
+    #cat_name = video.split('-')[0]
     cid_name = video.split('-')[1]
     video_basename = video.strip()
-    frame_folder = osp.join(video_folder, cat_name, video.strip(), "img")
+    frame_folder = osp.join(video_folder, video.strip(), "img")
 
-    num_frames = len(os.listdir(osp.join(video_folder, cat_name, video.strip(), "img")))
+    num_frames = len(os.listdir(osp.join(video_folder, video.strip(), "img")))
 
     print(f"\033[91mRunning video [{vid+1}/{len(test_videos)}]: {video} with {num_frames} frames\033[0m")
 
@@ -76,7 +76,7 @@ for vid, video in enumerate(test_videos):
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
         state = predictor.init_state(frame_folder, offload_video_to_cpu=True, offload_state_to_cpu=True, async_loading_frames=True)
 
-        prompts = load_lasot_gt(osp.join(video_folder, cat_name, video.strip(), "groundtruth.txt"))
+        prompts = load_lasot_gt(osp.join(video_folder, video.strip(), "groundtruth.txt"))
 
         bbox, track_label = prompts[0]
         frame_idx, object_ids, masks = predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=0)
