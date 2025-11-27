@@ -617,6 +617,212 @@ class SAM2Base(torch.nn.Module):
 
         return backbone_out, vision_feats, vision_pos_embeds, feat_sizes
 
+    def _select_conditioning_frames(self, frame_idx, output_dict):
+        """
+        Select conditioning frames for memory attention.
+        
+        Returns:
+            selected_cond_outputs: dict of selected conditioning frame outputs
+            unselected_cond_outputs: dict of unselected conditioning frame outputs
+            t_pos_and_prevs: initial list of (t_pos, output) tuples with t_pos=0 for cond frames
+        """
+        # Add conditioning frames's output first (all cond frames have t_pos=0 for
+        # when getting temporal positional embedding below)
+        assert len(output_dict["cond_frame_outputs"]) > 0
+        # Select a maximum number of temporally closest cond frames for cross attention
+        cond_outputs = output_dict["cond_frame_outputs"]
+        selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
+            frame_idx, cond_outputs, self.max_cond_frames_in_attn
+        )
+        t_pos_and_prevs = [(0, out) for out in selected_cond_outputs.values()]
+        return selected_cond_outputs, unselected_cond_outputs, t_pos_and_prevs
+
+    def _build_non_cond_memories_samurai(
+        self, frame_idx, output_dict, unselected_cond_outputs, t_pos_and_prevs
+    ):
+        """
+        Build non-conditioning memory frames using SAMURAI mode with quality-based selection.
+        
+        In SAMURAI mode, we select frames based on IoU score, object score, and KF score thresholds.
+        """
+        valid_indices = [] 
+        if frame_idx > 1:  # Ensure we have previous frames to evaluate
+            for i in range(frame_idx - 1, 1, -1):  # Iterate backwards through previous frames
+                iou_score = output_dict["non_cond_frame_outputs"][i]["best_iou_score"]  # Get mask affinity score
+                obj_score = output_dict["non_cond_frame_outputs"][i]["object_score_logits"]  # Get object score
+                kf_score = output_dict["non_cond_frame_outputs"][i]["kf_score"] if "kf_score" in output_dict["non_cond_frame_outputs"][i] else None  # Get motion score if available
+                # Check if the scores meet the criteria for being a valid index
+                if iou_score.item() > self.memory_bank_iou_threshold and \
+                   obj_score.item() > self.memory_bank_obj_score_threshold and \
+                   (kf_score is None or kf_score.item() > self.memory_bank_kf_score_threshold):
+                    valid_indices.insert(0, i)  
+                # Check the number of valid indices
+                if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:  
+                    break
+        if frame_idx - 1 not in valid_indices: 
+            valid_indices.append(frame_idx - 1)
+        for t_pos in range(1, self.num_maskmem):  # Iterate over the number of mask memories
+            idx = t_pos - self.num_maskmem  # Calculate the index for valid indices
+            if idx < -len(valid_indices):  # Skip if index is out of bounds
+                continue
+            out = output_dict["non_cond_frame_outputs"].get(valid_indices[idx], None)  # Get output for the valid index
+            if out is None:  # If not found, check unselected outputs
+                out = unselected_cond_outputs.get(valid_indices[idx], None)
+            t_pos_and_prevs.append((t_pos, out))  # Append the temporal position and output to the list
+        return t_pos_and_prevs
+
+    def _build_non_cond_memories_default(
+        self, frame_idx, output_dict, unselected_cond_outputs, t_pos_and_prevs, track_in_reverse
+    ):
+        """
+        Build non-conditioning memory frames using default temporal stride.
+        
+        Add last (self.num_maskmem - 1) frames before current frame for non-conditioning memory.
+        The earliest one has t_pos=1 and the latest one has t_pos=self.num_maskmem-1.
+        We also allow taking the memory frame non-consecutively (with stride>1), in which case
+        we take (self.num_maskmem - 2) frames among every stride-th frames plus the last frame.
+        """
+        stride = 1 if self.training else self.memory_temporal_stride_for_eval
+        for t_pos in range(1, self.num_maskmem):
+            t_rel = self.num_maskmem - t_pos  # how many frames before current frame
+            if t_rel == 1:
+                # for t_rel == 1, we take the last frame (regardless of r)
+                if not track_in_reverse:
+                    # the frame immediately before this frame (i.e. frame_idx - 1)
+                    prev_frame_idx = frame_idx - t_rel
+                else:
+                    # the frame immediately after this frame (i.e. frame_idx + 1)
+                    prev_frame_idx = frame_idx + t_rel
+            else:
+                # for t_rel >= 2, we take the memory frame from every r-th frames
+                if not track_in_reverse:
+                    # first find the nearest frame among every r-th frames before this frame
+                    # for r=1, this would be (frame_idx - 2)
+                    prev_frame_idx = ((frame_idx - 2) // stride) * stride
+                    # then seek further among every r-th frames
+                    prev_frame_idx = prev_frame_idx - (t_rel - 2) * stride
+                else:
+                    # first find the nearest frame among every r-th frames after this frame
+                    # for r=1, this would be (frame_idx + 2)
+                    prev_frame_idx = -(-(frame_idx + 2) // stride) * stride
+                    # then seek further among every r-th frames
+                    prev_frame_idx = prev_frame_idx + (t_rel - 2) * stride
+            out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
+            if out is None:
+                # If an unselected conditioning frame is among the last (self.num_maskmem - 1)
+                # frames, we still attend to it as if it's a non-conditioning frame.
+                out = unselected_cond_outputs.get(prev_frame_idx, None)
+            t_pos_and_prevs.append((t_pos, out))
+        return t_pos_and_prevs
+
+    def _expand_t_pos_and_prevs_to_tokens(self, t_pos_and_prevs, device):
+        """
+        Expand list of (t_pos, prev_output) into memory tokens and their positional encodings.
+        
+        Returns:
+            to_cat_memory: list of memory feature tensors
+            to_cat_memory_pos_embed: list of memory positional encoding tensors
+        """
+        to_cat_memory, to_cat_memory_pos_embed = [], []
+        for t_pos, prev in t_pos_and_prevs:
+            if prev is None:
+                continue  # skip padding frames
+            # "maskmem_features" might have been offloaded to CPU in demo use cases,
+            # so we load it back to GPU (it's a no-op if it's already on GPU).
+            feats = prev["maskmem_features"].to(device, non_blocking=True)
+            to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
+            # Spatial positional encoding (it might have been offloaded to CPU in eval)
+            maskmem_enc = prev["maskmem_pos_enc"][-1].to(device)
+            maskmem_enc = maskmem_enc.flatten(2).permute(2, 0, 1)
+            # Temporal positional encoding
+            maskmem_enc = (
+                maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1]
+            )
+            to_cat_memory_pos_embed.append(maskmem_enc)
+        return to_cat_memory, to_cat_memory_pos_embed
+
+    def _build_obj_ptr_tokens_for_encoder(
+        self,
+        frame_idx,
+        selected_cond_outputs,
+        unselected_cond_outputs,
+        output_dict,
+        num_frames,
+        track_in_reverse,
+        tpos_sign_mul,
+        B,
+        C,
+        device,
+    ):
+        """
+        Construct object pointer tokens from past frames for encoder cross-attention.
+        
+        Returns:
+            obj_ptrs: object pointer tokens to add to memory
+            obj_pos: positional encodings for object pointers
+            num_obj_ptr_tokens: number of object pointer tokens
+        """
+        max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder)
+        # First add those object pointers from selected conditioning frames
+        # (optionally, only include object pointers in the past during evaluation)
+        if not self.training and self.only_obj_ptrs_in_the_past_for_eval:
+            ptr_cond_outputs = {
+                t: out
+                for t, out in selected_cond_outputs.items()
+                if (t >= frame_idx if track_in_reverse else t <= frame_idx)
+            }
+        else:
+            ptr_cond_outputs = selected_cond_outputs
+        pos_and_ptrs = [
+            # Temporal pos encoding contains how far away each pointer is from current frame
+            (
+                (
+                    (frame_idx - t) * tpos_sign_mul
+                    if self.use_signed_tpos_enc_to_obj_ptrs
+                    else abs(frame_idx - t)
+                ),
+                out["obj_ptr"],
+            )
+            for t, out in ptr_cond_outputs.items()
+        ]
+        # Add up to (max_obj_ptrs_in_encoder - 1) non-conditioning frames before current frame
+        for t_diff in range(1, max_obj_ptrs_in_encoder):
+            t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
+            if t < 0 or (num_frames is not None and t >= num_frames):
+                break
+            out = output_dict["non_cond_frame_outputs"].get(
+                t, unselected_cond_outputs.get(t, None)
+            )
+            if out is not None:
+                pos_and_ptrs.append((t_diff, out["obj_ptr"]))
+        # If we have at least one object pointer, add them to the across attention
+        if len(pos_and_ptrs) > 0:
+            pos_list, ptrs_list = zip(*pos_and_ptrs)
+            # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
+            obj_ptrs = torch.stack(ptrs_list, dim=0)
+            # a temporal positional embedding based on how far each object pointer is from
+            # the current frame (sine embedding normalized by the max pointer num).
+            if self.add_tpos_enc_to_obj_ptrs:
+                t_diff_max = max_obj_ptrs_in_encoder - 1
+                tpos_dim = C if self.proj_tpos_enc_in_obj_ptrs else self.mem_dim
+                obj_pos = torch.tensor(pos_list, device=device)
+                obj_pos = get_1d_sine_pe(obj_pos / t_diff_max, dim=tpos_dim)
+                obj_pos = self.obj_ptr_tpos_proj(obj_pos)
+                obj_pos = obj_pos.unsqueeze(1).expand(-1, B, self.mem_dim)
+            else:
+                obj_pos = obj_ptrs.new_zeros(len(pos_list), B, self.mem_dim)
+            if self.mem_dim < C:
+                # split a pointer into (C // self.mem_dim) tokens for self.mem_dim < C
+                obj_ptrs = obj_ptrs.reshape(
+                    -1, B, C // self.mem_dim, self.mem_dim
+                )
+                obj_ptrs = obj_ptrs.permute(0, 2, 1, 3).flatten(0, 1)
+                obj_pos = obj_pos.repeat_interleave(C // self.mem_dim, dim=0)
+            num_obj_ptr_tokens = obj_ptrs.shape[0]
+            return obj_ptrs, obj_pos, num_obj_ptr_tokens
+        else:
+            return None, None, 0
+
     def _prepare_memory_conditioned_features(
         self,
         frame_idx,
@@ -626,189 +832,73 @@ class SAM2Base(torch.nn.Module):
         feat_sizes,
         output_dict,
         num_frames,
-        track_in_reverse=False,  # tracking in reverse time order (for demo usage)
+        track_in_reverse=False,  # 是否按时间反向跟踪（仅用于 demo 使用场景）
     ):
-        """Fuse the current frame's visual feature map with previous memory."""
+        """将当前帧的视觉特征图与历史记忆特征进行融合。"""
         B = current_vision_feats[-1].size(1)  # batch size on this frame
         C = self.hidden_dim
         H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
         device = current_vision_feats[-1].device
-        # The case of `self.num_maskmem == 0` below is primarily used for reproducing SAM on images.
-        # In this case, we skip the fusion with any memory.
-        if self.num_maskmem == 0:  # Disable memory and skip fusion
+        
+        if self.num_maskmem == 0:  # 关闭记忆功能并跳过记忆融合
             pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
             return pix_feat
 
         num_obj_ptr_tokens = 0
         tpos_sign_mul = -1 if track_in_reverse else 1
-        # Step 1: condition the visual features of the current frame on previous memories
+        
+        # 第 1 步：使用历史记忆特征对当前帧的视觉特征进行条件化（融合）
         if not is_init_cond_frame:
-            # Retrieve the memories encoded with the maskmem backbone
-            to_cat_memory, to_cat_memory_pos_embed = [], []
-            # Add conditioning frames's output first (all cond frames have t_pos=0 for
-            # when getting temporal positional embedding below)
-            assert len(output_dict["cond_frame_outputs"]) > 0
-            # Select a maximum number of temporally closest cond frames for cross attention
-            cond_outputs = output_dict["cond_frame_outputs"]
-            selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
-                frame_idx, cond_outputs, self.max_cond_frames_in_attn
+            # 选择参与记忆注意力的条件帧，并初始化记忆列表
+            selected_cond_outputs, unselected_cond_outputs, t_pos_and_prevs = (
+                self._select_conditioning_frames(frame_idx, output_dict)
             )
-            t_pos_and_prevs = [(0, out) for out in selected_cond_outputs.values()]
-            # Add last (self.num_maskmem - 1) frames before current frame for non-conditioning memory
-            # the earliest one has t_pos=1 and the latest one has t_pos=self.num_maskmem-1
-            # We also allow taking the memory frame non-consecutively (with stride>1), in which case
-            # we take (self.num_maskmem - 2) frames among every stride-th frames plus the last frame.
-            stride = 1 if self.training else self.memory_temporal_stride_for_eval
-
+            
+            # 根据当前模式（SAMURAI / 默认）构建非条件帧的记忆列表
             if self.samurai_mode:
-                valid_indices = [] 
-                if frame_idx > 1:  # Ensure we have previous frames to evaluate
-                    for i in range(frame_idx - 1, 1, -1):  # Iterate backwards through previous frames
-                        iou_score = output_dict["non_cond_frame_outputs"][i]["best_iou_score"]  # Get mask affinity score
-                        obj_score = output_dict["non_cond_frame_outputs"][i]["object_score_logits"]  # Get object score
-                        kf_score = output_dict["non_cond_frame_outputs"][i]["kf_score"] if "kf_score" in output_dict["non_cond_frame_outputs"][i] else None  # Get motion score if available
-                        # Check if the scores meet the criteria for being a valid index
-                        if iou_score.item() > self.memory_bank_iou_threshold and \
-                           obj_score.item() > self.memory_bank_obj_score_threshold and \
-                           (kf_score is None or kf_score.item() > self.memory_bank_kf_score_threshold):
-                            valid_indices.insert(0, i)  
-                        # Check the number of valid indices
-                        if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:  
-                            break
-                if frame_idx - 1 not in valid_indices: 
-                    valid_indices.append(frame_idx - 1)
-                for t_pos in range(1, self.num_maskmem):  # Iterate over the number of mask memories
-                    idx = t_pos - self.num_maskmem  # Calculate the index for valid indices
-                    if idx < -len(valid_indices):  # Skip if index is out of bounds
-                        continue
-                    out = output_dict["non_cond_frame_outputs"].get(valid_indices[idx], None)  # Get output for the valid index
-                    if out is None:  # If not found, check unselected outputs
-                        out = unselected_cond_outputs.get(valid_indices[idx], None)
-                    t_pos_and_prevs.append((t_pos, out))  # Append the temporal position and output to the list
-            else:
-                for t_pos in range(1, self.num_maskmem):
-                    t_rel = self.num_maskmem - t_pos  # how many frames before current frame
-                    if t_rel == 1:
-                        # for t_rel == 1, we take the last frame (regardless of r)
-                        if not track_in_reverse:
-                            # the frame immediately before this frame (i.e. frame_idx - 1)
-                            prev_frame_idx = frame_idx - t_rel
-                        else:
-                            # the frame immediately after this frame (i.e. frame_idx + 1)
-                            prev_frame_idx = frame_idx + t_rel
-                    else:
-                        # for t_rel >= 2, we take the memory frame from every r-th frames
-                        if not track_in_reverse:
-                            # first find the nearest frame among every r-th frames before this frame
-                            # for r=1, this would be (frame_idx - 2)
-                            prev_frame_idx = ((frame_idx - 2) // stride) * stride
-                            # then seek further among every r-th frames
-                            prev_frame_idx = prev_frame_idx - (t_rel - 2) * stride
-                        else:
-                            # first find the nearest frame among every r-th frames after this frame
-                            # for r=1, this would be (frame_idx + 2)
-                            prev_frame_idx = -(-(frame_idx + 2) // stride) * stride
-                            # then seek further among every r-th frames
-                            prev_frame_idx = prev_frame_idx + (t_rel - 2) * stride
-                    out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
-                    if out is None:
-                        # If an unselected conditioning frame is among the last (self.num_maskmem - 1)
-                        # frames, we still attend to it as if it's a non-conditioning frame.
-                        out = unselected_cond_outputs.get(prev_frame_idx, None)
-                    t_pos_and_prevs.append((t_pos, out))
-
-            for t_pos, prev in t_pos_and_prevs:
-                if prev is None:
-                    continue  # skip padding frames
-                # "maskmem_features" might have been offloaded to CPU in demo use cases,
-                # so we load it back to GPU (it's a no-op if it's already on GPU).
-                feats = prev["maskmem_features"].to(device, non_blocking=True)
-                to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
-                # Spatial positional encoding (it might have been offloaded to CPU in eval)
-                maskmem_enc = prev["maskmem_pos_enc"][-1].to(device)
-                maskmem_enc = maskmem_enc.flatten(2).permute(2, 0, 1)
-                # Temporal positional encoding
-                maskmem_enc = (
-                    maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1]
+                t_pos_and_prevs = self._build_non_cond_memories_samurai(
+                    frame_idx, output_dict, unselected_cond_outputs, t_pos_and_prevs
                 )
-                to_cat_memory_pos_embed.append(maskmem_enc)
-
-            # Construct the list of past object pointers
+            else:
+                t_pos_and_prevs = self._build_non_cond_memories_default(
+                    frame_idx, output_dict, unselected_cond_outputs, t_pos_and_prevs, track_in_reverse
+                )
+            
+            # 将 (t_pos, prev_output) 对转换为记忆 token 序列
+            to_cat_memory, to_cat_memory_pos_embed = self._expand_t_pos_and_prevs_to_tokens(
+                t_pos_and_prevs, device
+            )
+            
+            # 构建用于编码器跨注意力的历史对象指针列表
             if self.use_obj_ptrs_in_encoder:
-                max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder)
-                # First add those object pointers from selected conditioning frames
-                # (optionally, only include object pointers in the past during evaluation)
-                if not self.training and self.only_obj_ptrs_in_the_past_for_eval:
-                    ptr_cond_outputs = {
-                        t: out
-                        for t, out in selected_cond_outputs.items()
-                        if (t >= frame_idx if track_in_reverse else t <= frame_idx)
-                    }
-                else:
-                    ptr_cond_outputs = selected_cond_outputs
-                pos_and_ptrs = [
-                    # Temporal pos encoding contains how far away each pointer is from current frame
-                    (
-                        (
-                            (frame_idx - t) * tpos_sign_mul
-                            if self.use_signed_tpos_enc_to_obj_ptrs
-                            else abs(frame_idx - t)
-                        ),
-                        out["obj_ptr"],
-                    )
-                    for t, out in ptr_cond_outputs.items()
-                ]
-                # Add up to (max_obj_ptrs_in_encoder - 1) non-conditioning frames before current frame
-                for t_diff in range(1, max_obj_ptrs_in_encoder):
-                    t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
-                    if t < 0 or (num_frames is not None and t >= num_frames):
-                        break
-                    out = output_dict["non_cond_frame_outputs"].get(
-                        t, unselected_cond_outputs.get(t, None)
-                    )
-                    if out is not None:
-                        pos_and_ptrs.append((t_diff, out["obj_ptr"]))
-                # If we have at least one object pointer, add them to the across attention
-                if len(pos_and_ptrs) > 0:
-                    pos_list, ptrs_list = zip(*pos_and_ptrs)
-                    # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
-                    obj_ptrs = torch.stack(ptrs_list, dim=0)
-                    # a temporal positional embedding based on how far each object pointer is from
-                    # the current frame (sine embedding normalized by the max pointer num).
-                    if self.add_tpos_enc_to_obj_ptrs:
-                        t_diff_max = max_obj_ptrs_in_encoder - 1
-                        tpos_dim = C if self.proj_tpos_enc_in_obj_ptrs else self.mem_dim
-                        obj_pos = torch.tensor(pos_list, device=device)
-                        obj_pos = get_1d_sine_pe(obj_pos / t_diff_max, dim=tpos_dim)
-                        obj_pos = self.obj_ptr_tpos_proj(obj_pos)
-                        obj_pos = obj_pos.unsqueeze(1).expand(-1, B, self.mem_dim)
-                    else:
-                        obj_pos = obj_ptrs.new_zeros(len(pos_list), B, self.mem_dim)
-                    if self.mem_dim < C:
-                        # split a pointer into (C // self.mem_dim) tokens for self.mem_dim < C
-                        obj_ptrs = obj_ptrs.reshape(
-                            -1, B, C // self.mem_dim, self.mem_dim
-                        )
-                        obj_ptrs = obj_ptrs.permute(0, 2, 1, 3).flatten(0, 1)
-                        obj_pos = obj_pos.repeat_interleave(C // self.mem_dim, dim=0)
+                obj_ptrs, obj_pos, num_obj_ptr_tokens = self._build_obj_ptr_tokens_for_encoder(
+                    frame_idx,
+                    selected_cond_outputs,
+                    unselected_cond_outputs,
+                    output_dict,
+                    num_frames,
+                    track_in_reverse,
+                    tpos_sign_mul,
+                    B,
+                    C,
+                    device,
+                )
+                if obj_ptrs is not None:
                     to_cat_memory.append(obj_ptrs)
                     to_cat_memory_pos_embed.append(obj_pos)
-                    num_obj_ptr_tokens = obj_ptrs.shape[0]
-                else:
-                    num_obj_ptr_tokens = 0
         else:
-            # for initial conditioning frames, encode them without using any previous memory
+            # 对初始条件帧，不使用任何历史记忆来编码当前帧
             if self.directly_add_no_mem_embed:
-                # directly add no-mem embedding (instead of using the transformer encoder)
+                # 直接将 no-mem 嵌入加到当前特征上（而不是通过 transformer 编码器）
                 pix_feat_with_mem = current_vision_feats[-1] + self.no_mem_embed
                 pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
                 return pix_feat_with_mem
 
-            # Use a dummy token on the first frame (to avoid empty memory input to tranformer encoder)
+            # 在第一帧上使用一个 dummy 记忆 token，避免 transformer 编码器收到空记忆输入
             to_cat_memory = [self.no_mem_embed.expand(1, B, self.mem_dim)]
             to_cat_memory_pos_embed = [self.no_mem_pos_enc.expand(1, B, self.mem_dim)]
 
-        # Step 2: Concatenate the memories and forward through the transformer encoder
+        # 第 2 步：将所有记忆 token 拼接后送入 transformer 编码器
         memory = torch.cat(to_cat_memory, dim=0)
         memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
 
@@ -819,7 +909,7 @@ class SAM2Base(torch.nn.Module):
             memory_pos=memory_pos_embed,
             num_obj_ptr_tokens=num_obj_ptr_tokens,
         )
-        # reshape the output (HW)BC => BCHW
+        # 将输出从 (HW)BC 重新变形为 BCHW 格式
         pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
         return pix_feat_with_mem
 
@@ -831,38 +921,37 @@ class SAM2Base(torch.nn.Module):
         object_score_logits,
         is_mask_from_pts,
     ):
-        """Encode the current image and its prediction into a memory feature."""
-        B = current_vision_feats[-1].size(1)  # batch size on this frame
+        """将当前图像及其预测结果编码为记忆特征。"""
+        B = current_vision_feats[-1].size(1)  # 当前帧的 batch 大小
         C = self.hidden_dim
-        H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
-        # top-level feature, (HW)BC => BCHW
+        H, W = feat_sizes[-1]  # 顶层（最低分辨率）特征的空间尺寸
+        # 顶层特征，从 (HW)BC 重新变形为 BCHW
         pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
         if self.non_overlap_masks_for_mem_enc and not self.training:
-            # optionally, apply non-overlapping constraints to the masks (it's applied
-            # in the batch dimension and should only be used during eval, where all
-            # the objects come from the same video under batch size 1).
+            # 可选地对掩码施加非重叠约束（在 batch 维度上操作，只推荐在推理阶段使用，
+            # 此时 batch size 为 1，且所有对象都来自同一个视频）。
             pred_masks_high_res = self._apply_non_overlapping_constraints(
                 pred_masks_high_res
             )
-        # scale the raw mask logits with a temperature before applying sigmoid
+        # 在应用 sigmoid 之前，先用温度系数对原始 mask logit 做缩放
         binarize = self.binarize_mask_from_pts_for_mem_enc and is_mask_from_pts
         if binarize and not self.training:
             mask_for_mem = (pred_masks_high_res > 0).float()
         else:
-            # apply sigmoid on the raw mask logits to turn them into range (0, 1)
+            # 对原始 mask logit 做 sigmoid，将其压缩到 (0, 1) 区间
             mask_for_mem = torch.sigmoid(pred_masks_high_res)
-        # apply scale and bias terms to the sigmoid probabilities
+        # 在 sigmoid 概率上再施加缩放和偏置项
         if self.sigmoid_scale_for_mem_enc != 1.0:
             mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
         if self.sigmoid_bias_for_mem_enc != 0.0:
             mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
         maskmem_out = self.memory_encoder(
-            pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
+            pix_feat, mask_for_mem, skip_mask_sigmoid=True  # 此处已经显式执行过 sigmoid
         )
         maskmem_features = maskmem_out["vision_features"]
         maskmem_pos_enc = maskmem_out["vision_pos_enc"]
-        # add a no-object embedding to the spatial memory to indicate that the frame
-        # is predicted to be occluded (i.e. no object is appearing in the frame)
+        # 向空间记忆中加入 no-object 嵌入，以指示该帧被预测为遮挡帧
+        # （即该帧中没有目标出现）
         if self.no_obj_embed_spatial is not None:
             is_obj_appearing = (object_score_logits > 0).float()
             maskmem_features += (
@@ -888,7 +977,7 @@ class SAM2Base(torch.nn.Module):
         prev_sam_mask_logits,
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
-        # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
+        # 为 SAM 头构建高分辨率特征图，将 (HW)BC 重新变形为 BCHW
         if len(current_vision_feats) > 1:
             high_res_features = [
                 x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
@@ -897,15 +986,15 @@ class SAM2Base(torch.nn.Module):
         else:
             high_res_features = None
         if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
-            # When use_mask_input_as_output_without_sam=True, we directly output the mask input
-            # (see it as a GT mask) without using a SAM prompt encoder + mask decoder.
+            # 当 use_mask_input_as_output_without_sam=True 时，直接把输入的 mask 作为输出
+            # （视作 GT 掩码），不经过 SAM 的 prompt encoder + mask decoder。
             pix_feat = current_vision_feats[-1].permute(1, 2, 0)
             pix_feat = pix_feat.view(-1, self.hidden_dim, *feat_sizes[-1])
             sam_outputs = self._use_mask_as_output(
                 pix_feat, high_res_features, mask_inputs
             )
         else:
-            # fused the visual feature with previous memory features in the memory bank
+            # 将当前帧的视觉特征与记忆库中的历史记忆特征进行融合
             pix_feat = self._prepare_memory_conditioned_features(
                 frame_idx=frame_idx,
                 is_init_cond_frame=is_init_cond_frame,
@@ -916,10 +1005,10 @@ class SAM2Base(torch.nn.Module):
                 num_frames=num_frames,
                 track_in_reverse=track_in_reverse,
             )
-            # apply SAM-style segmentation head
-            # here we might feed previously predicted low-res SAM mask logits into the SAM mask decoder,
-            # e.g. in demo where such logits come from earlier interaction instead of correction sampling
-            # (in this case, any `mask_inputs` shouldn't reach here as they are sent to _use_mask_as_output instead)
+            # 应用 SAM 风格的分割头
+            # 这里可能会把之前预测得到的低分辨率 SAM mask logit 重新送入 SAM mask decoder，
+            # 例如在 demo 中，这些 logit 可能来自更早的交互而不是当前的纠错采样；
+            # 此时任何 `mask_inputs` 都不应该走到这里，而是已经在 _use_mask_as_output 中被处理。
             if prev_sam_mask_logits is not None:
                 assert point_inputs is not None and mask_inputs is None
                 mask_inputs = prev_sam_mask_logits
@@ -970,14 +1059,13 @@ class SAM2Base(torch.nn.Module):
         mask_inputs,
         output_dict,
         num_frames,
-        track_in_reverse=False,  # tracking in reverse time order (for demo usage)
-        # Whether to run the memory encoder on the predicted masks. Sometimes we might want
-        # to skip the memory encoder with `run_mem_encoder=False`. For example,
-        # in demo we might call `track_step` multiple times for each user click,
-        # and only encode the memory when the user finalizes their clicks. And in ablation
-        # settings like SAM training on static images, we don't need the memory encoder.
+        track_in_reverse=False,  # 是否按时间反向跟踪（仅用于 demo 使用场景）
+        # 是否在预测的掩码上运行 memory encoder。有时我们希望将 `run_mem_encoder=False`
+        # 来跳过记忆编码。例如在 demo 中，可能会针对一次用户点击多次调用 `track_step`，
+        # 只有当用户确认最终点击结果时才真正写入记忆；又如在静态图像上的 SAM 训练等消融设定中，
+        # 完全不需要启用 memory encoder。
         run_mem_encoder=True,
-        # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
+        # 之前预测得到的 SAM mask logit（在 demo 中可与新的点击一起送入解码器）。
         prev_sam_mask_logits=None,
     ):
         current_out, sam_outputs, _, _ = self._track_step(
@@ -1012,12 +1100,12 @@ class SAM2Base(torch.nn.Module):
         current_out["best_iou_score"] = best_iou_score
         current_out["kf_ious"] = kf_ious
         if not self.training:
-            # Only add this in inference (to avoid unused param in activation checkpointing;
-            # it's mainly used in the demo to encode spatial memories w/ consolidated masks)
+            # 仅在推理阶段写入该字段（避免在激活检查点中出现未使用的参数）；
+            # 这一字段主要在 demo 中使用，用于在合并后的掩码上编码空间记忆。
             current_out["object_score_logits"] = object_score_logits
 
-        # Finally run the memory encoder on the predicted mask to encode
-        # it into a new memory feature (that can be used in future frames)
+        # 最后在预测掩码上运行 memory encoder，
+        # 将其编码为新的记忆特征，供后续帧使用。
         self._encode_memory_in_output(
             current_vision_feats,
             feat_sizes,
@@ -1031,7 +1119,7 @@ class SAM2Base(torch.nn.Module):
         return current_out
 
     def _use_multimask(self, is_init_cond_frame, point_inputs):
-        """Whether to use multimask output in the SAM head."""
+        """是否在 SAM 头中启用多掩码输出（multimask）。"""
         num_pts = 0 if point_inputs is None else point_inputs["point_labels"].size(1)
         multimask_output = (
             self.multimask_output_in_sam
@@ -1041,21 +1129,19 @@ class SAM2Base(torch.nn.Module):
         return multimask_output
 
     def _apply_non_overlapping_constraints(self, pred_masks):
-        """
-        Apply non-overlapping constraints to the object scores in pred_masks. Here we
-        keep only the highest scoring object at each spatial location in pred_masks.
-        """
+        """对 pred_masks 中的目标分数施加非重叠约束。
+        在每个空间位置上，仅保留得分最高的目标。"""
         batch_size = pred_masks.size(0)
         if batch_size == 1:
             return pred_masks
 
         device = pred_masks.device
-        # "max_obj_inds": object index of the object with the highest score at each location
+        # "max_obj_inds"：每个空间位置上得分最高的目标索引
         max_obj_inds = torch.argmax(pred_masks, dim=0, keepdim=True)
-        # "batch_obj_inds": object index of each object slice (along dim 0) in `pred_masks`
+        # "batch_obj_inds"：`pred_masks` 沿 dim 0 的每个切片对应的目标索引
         batch_obj_inds = torch.arange(batch_size, device=device)[:, None, None, None]
         keep = max_obj_inds == batch_obj_inds
-        # suppress overlapping regions' scores below -10.0 so that the foreground regions
-        # don't overlap (here sigmoid(-10.0)=4.5398e-05)
+        # 将重叠区域的分数压到 -10.0 以下，从而使前景区域之间尽量不重叠
+        # （此时 sigmoid(-10.0)=4.5398e-05，几乎视为背景）。
         pred_masks = torch.where(keep, pred_masks, torch.clamp(pred_masks, max=-10.0))
         return pred_masks
