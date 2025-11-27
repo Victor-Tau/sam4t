@@ -5,6 +5,7 @@ import numpy as np
 import os
 import os.path as osp
 import torch
+import time
 from sam2.build_sam import build_sam2_video_predictor
 from tqdm import tqdm
 
@@ -32,7 +33,7 @@ color = [
 ]
 
 # GOT-10k dataset path
-video_folder = "/data/yangkai/pytracking/testing_dataset/GOT-10k/test"
+video_folder = "/home/tau/datasets/test"
 
 exp_name = "samurai"
 model_name = "base_plus"
@@ -54,6 +55,11 @@ if save_to_video:
 test_videos = sorted(glob.glob(f"{video_folder}/*"))
 print(f"Found {len(test_videos)} videos in {video_folder}")
 
+# Build predictor once and reuse it for all videos
+predictor = build_sam2_video_predictor(model_cfg, checkpoint, device="cuda:0")
+print("Model loaded successfully")
+start_time = time.time()
+
 for vid, video_path in enumerate(test_videos):
     video_basename = osp.basename(video_path)
     frame_folder = video_path  # GOT-10k frames are directly in video folder
@@ -72,8 +78,6 @@ for vid, video_path in enumerate(test_videos):
     first_frame_path = frames[0]
     height, width = cv2.imread(first_frame_path).shape[:2]
 
-    predictor = build_sam2_video_predictor(model_cfg, checkpoint, device="cuda:0")
-
     predictions = []
 
     if save_to_video:
@@ -82,7 +86,7 @@ for vid, video_path in enumerate(test_videos):
 
     # Start processing frames
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-        state = predictor.init_state(frame_folder, offload_video_to_cpu=True, offload_state_to_cpu=True, async_loading_frames=True)
+        state = predictor.init_state(frame_folder, offload_video_to_cpu=False, offload_state_to_cpu=False, async_loading_frames=True)
 
         # Load groundtruth
         gt_path = osp.join(video_path, "groundtruth.txt")
@@ -152,14 +156,15 @@ for vid, video_path in enumerate(test_videos):
     if save_to_video:
         out.release() 
 
-    del predictor
+    # Clean up state for this video
     del state
     gc.collect()
-    torch.clear_autocast_cache()
     torch.cuda.empty_cache()
 
 print("\033[92m✓ Inference completed!\033[0m")
+end_time = time.time()
+total_time = end_time - start_time
+print(f"\u63a8\u7406 GOT-10k \u6570\u636e\u96c6\u603b\u8017\u65f6: {total_time:.2f} \u79d2")
 print(f"Results saved to: {pred_folder}")
 if save_to_video:
     print(f"Visualizations saved to: {vis_folder}")
-
